@@ -49,6 +49,15 @@ Anchor inheritance (IDEV-3156):
   SQL alone, so we adopt their anchor but leave their status untouched and
   surface them in the result for a human to clear.
 
+  A parked row is only safe once the consolidated repost that inherits its
+  anchor exists (IDEV-3266 review). So parking never happens on a dry run, and
+  a run that parks and then ends WITHOUT submitting the consolidated repost
+  (no drafts submitted, or an exception) puts the parked rows back to Queued.
+  A Transaction-based repost whose voucher also moves stock on another
+  item/warehouse is never parked: the consolidated repost covers only the hot
+  key, so parking it would drop the other pairs' repost. Its anchor is still
+  adopted; it stays Queued (reported as riv_left_queued_multi_pair).
+
 Identity guarantee:
   Field-by-field diff against native ERPNext submit + consolidated repost
   on the same input set produces 0 diffs on SLE, GL, and Bin (verified at
@@ -83,8 +92,11 @@ HOT_WAREHOUSE = "Default Warehouse - FFSL"
 PENDING_RIV_STATUSES = ("Queued", "In Progress")
 
 
-def _quiesce_pending_rivs(item_code: str, warehouse: str) -> dict:
+def _quiesce_pending_rivs(item_code: str, warehouse: str, park: bool = True) -> dict:
     """Park Queued RIVs for the hot key and report every pending anchor.
+
+    park=False (dry run) only reads: anchors and would-be-parked rows are
+    reported, nothing is updated.
 
     Parking matters because an independent repost walking the same
     item+warehouse while the drain submits will contend for the same rows —
@@ -103,7 +115,13 @@ def _quiesce_pending_rivs(item_code: str, warehouse: str) -> dict:
     # voucher still owes a repost).
     rows = frappe.db.sql(
         """
-        SELECT riv.name, riv.posting_date, riv.status, riv.based_on
+        SELECT riv.name, riv.posting_date, riv.status, riv.based_on,
+               (riv.based_on = 'Transaction' AND EXISTS (
+                    SELECT 1 FROM `tabStock Ledger Entry` other
+                    WHERE other.voucher_type = riv.voucher_type
+                      AND other.voucher_no   = riv.voucher_no
+                      AND (other.item_code <> %(item_code)s OR other.warehouse <> %(warehouse)s)
+               )) AS touches_other_pairs
         FROM `tabRepost Item Valuation` riv
         WHERE riv.status IN %(statuses)s
           AND riv.docstatus = 1
@@ -130,21 +148,41 @@ def _quiesce_pending_rivs(item_code: str, warehouse: str) -> dict:
     )
 
     queued = [r for r in rows if r.status == "Queued"]
+    parkable = [r for r in queued if not r.touches_other_pairs]
+    multi_pair = [r for r in queued if r.touches_other_pairs]
     in_progress = [r for r in rows if r.status == "In Progress"]
 
-    if queued:
+    if park and parkable:
         frappe.db.sql(
             "UPDATE `tabRepost Item Valuation` SET status='Skipped' WHERE name IN %s",
-            (tuple(r.name for r in queued),),
+            (tuple(r.name for r in parkable),),
         )
         frappe.db.commit()
 
     return {
         # every pending anchor, parked or not — the caller MUST fold these in
         "anchors": [r.posting_date for r in rows if r.posting_date],
-        "parked": [r.name for r in queued],
+        "parked": [r.name for r in parkable] if park else [],
+        "would_park": [] if park else [r.name for r in parkable],
+        "left_queued_multi_pair": [r.name for r in multi_pair],
         "in_progress_untouched": [r.name for r in in_progress],
     }
+
+
+def _unpark_rivs(names: list) -> list:
+    """Put rows this run parked back to Queued (only while still 'Skipped').
+
+    For a run that parked reposts but never submitted the consolidated repost
+    that inherits their anchors: without this their valuation repair is lost.
+    """
+    if not names:
+        return []
+    frappe.db.sql(
+        "UPDATE `tabRepost Item Valuation` SET status='Queued' WHERE name IN %s AND status='Skipped'",
+        (tuple(names),),
+    )
+    frappe.db.commit()
+    return list(names)
 
 
 @frappe.whitelist()
@@ -191,6 +229,10 @@ def drain(
     # Set before anything can fail, so the exception path knows whether this
     # call ever held the run key (cleanup is compare-and-delete on it).
     run_id: Optional[str] = None
+    # RIVs this call parked, and whether the consolidated repost that inherits
+    # their anchors was submitted: until it is, parked rows must be restorable.
+    parked: list = []
+    consolidated_submitted = False
     result: dict = {
         "stage": "in_progress",
         "params": {
@@ -235,9 +277,13 @@ def drain(
         # 3. Quiesce pre-existing RIVs in the path, ADOPTING their anchors
         # ------------------------------------------------------------------
         inherited_anchors: list = []
-        quiesced_pre = _quiesce_pending_rivs(item_code, warehouse)
+        # A dry run only reads: nothing is parked, so nothing can be lost.
+        quiesced_pre = _quiesce_pending_rivs(item_code, warehouse, park=not dry_run)
         inherited_anchors += quiesced_pre["anchors"]
+        parked += quiesced_pre["parked"]
         result["riv_parked_pre"] = quiesced_pre["parked"]
+        result["riv_would_park_pre"] = quiesced_pre["would_park"]
+        result["riv_left_queued_multi_pair"] = quiesced_pre["left_queued_multi_pair"]
         result["riv_in_progress_untouched"] = quiesced_pre["in_progress_untouched"]
 
         # ------------------------------------------------------------------
@@ -324,6 +370,9 @@ def drain(
             return result
 
         if not submitted:
+            # Nothing to repost for, so no consolidated repost will inherit the
+            # parked anchors: hand them back to ERPNext's own queue.
+            result["riv_unparked"] = _unpark_rivs(parked)
             shadow_bin.cleanup(run_id)
             result["stage"] = "no_submits"
             result["timings"] = timings
@@ -336,7 +385,11 @@ def drain(
         # adopting anchors so nothing is lost.
         quiesced_post = _quiesce_pending_rivs(item_code, warehouse)
         inherited_anchors += quiesced_post["anchors"]
+        parked += quiesced_post["parked"]
         result["riv_parked_post"] = quiesced_post["parked"]
+        result["riv_left_queued_multi_pair"] = sorted(
+            set(result["riv_left_queued_multi_pair"]) | set(quiesced_post["left_queued_multi_pair"])
+        )
         result["riv_in_progress_untouched"] = sorted(
             set(result["riv_in_progress_untouched"])
             | set(quiesced_post["in_progress_untouched"])
@@ -376,6 +429,7 @@ def drain(
             }).insert(ignore_permissions=True)
             riv.submit()
             frappe.db.commit()
+            consolidated_submitted = True
             shadow_bin.cleanup(run_id)
             result["stage"] = "repost_deferred_anchor_too_early"
             result["repost_anchor"] = str(exc.anchor)
@@ -403,6 +457,7 @@ def drain(
         }).insert(ignore_permissions=True)
         riv.submit()
         frappe.db.commit()
+        consolidated_submitted = True
 
         from erpnext.stock.doctype.repost_item_valuation.repost_item_valuation import (
             repost as run_repost,
@@ -527,6 +582,14 @@ def drain(
         return result
 
     except Exception as exc:
+        # Parked reposts whose anchors no consolidated repost inherited yet go
+        # back to Queued, or the run would silently discard them.
+        if parked and not consolidated_submitted:
+            try:
+                frappe.db.rollback()
+                result["riv_unparked"] = _unpark_rivs(parked)
+            except Exception:
+                result["riv_unpark_failed"] = list(parked)
         # Best-effort cleanup
         try:
             shadow_bin.cleanup(run_id)

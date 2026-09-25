@@ -160,6 +160,85 @@ class TestDrainRepostAnchor(FrappeTestCase):
         # the failed drain's cleanup must not release the amend's key
         self.assertEqual(self.r.get(shadow_bin.RUN_KEY), "qc-amend:episode-x:1234")
 
+    # ---- parked reposts are never lost (IDEV-3266 review) --------------------------------------
+    def _amend_repost(self, posting_date="2026-06-16"):
+        """The Transaction-based repost a quantity-correction amend (backdated cancel + reissue)
+        leaves Queued."""
+        early = self._draft(posting_date)
+        early.submit()
+        frappe.db.commit()
+        return self._queued_riv(posting_date, based_on="Transaction", voucher_type="Delivery Note",
+                                voucher_no=early.name)
+
+    def _status(self, riv):
+        return frappe.db.get_value("Repost Item Valuation", riv.name, "status")
+
+    def test_dry_run_parks_nothing(self):
+        pending = self._amend_repost()
+        self._draft("2026-08-23")
+
+        result = self._drain("2026-08-23", "2026-08-23", dry_run=1)
+
+        self.assertEqual(result["stage"], "dry_run_complete", result.get("error"))
+        self.assertEqual(result["riv_parked_pre"], [])
+        self.assertIn(pending.name, result["riv_would_park_pre"])
+        self.assertEqual(self._status(pending), "Queued", "a dry run must not discard the amend's repost")
+
+    def test_no_submits_puts_parked_reposts_back(self):
+        pending = self._amend_repost()
+        self._draft("2026-08-24", qty=10_000_000)  # far beyond stock: skipped as negative
+
+        result = self._drain("2026-08-24", "2026-08-24")
+
+        self.assertEqual(result["stage"], "no_submits", result.get("error"))
+        self.assertEqual(result["skipped_negative_count"], 1)
+        self.assertIn(pending.name, result["riv_parked_pre"])
+        self.assertIn(pending.name, result["riv_unparked"])
+        self.assertEqual(self._status(pending), "Queued")
+
+    def test_exception_before_the_consolidated_repost_puts_parked_reposts_back(self):
+        pending = self._amend_repost()
+        self._draft("2026-08-25")
+
+        with patch.object(shadow_bin, "will_cause_negative", side_effect=RuntimeError("redis went away")):
+            result = self._drain("2026-08-25", "2026-08-25")
+
+        self.assertEqual(result["stage"], "exception")
+        self.assertIn(pending.name, result["riv_unparked"])
+        self.assertEqual(self._status(pending), "Queued")
+        self.assertIsNone(self.r.get(shadow_bin.RUN_KEY))
+
+    def test_multi_pair_transaction_repost_is_left_queued_but_its_anchor_adopted(self):
+        other_wh = _ensure_warehouse(f"QC Drain Other {frappe.generate_hash(length=6).upper()}", self.company)
+        _receive(self.item, other_wh, self.company, 1_000, "2026-01-02")
+        two_pairs = frappe.get_doc(
+            {
+                "doctype": "Delivery Note",
+                "company": self.company,
+                "customer": self.customer,
+                "posting_date": "2026-06-17",
+                "posting_time": "10:00:00",
+                "set_posting_time": 1,
+                "items": [
+                    {"item_code": self.item, "qty": 10, "rate": RATE, "warehouse": self.wh, "uom": "Litre"},
+                    {"item_code": self.item, "qty": 10, "rate": RATE, "warehouse": other_wh, "uom": "Litre"},
+                ],
+            }
+        ).insert(ignore_permissions=True)
+        two_pairs.submit()
+        frappe.db.commit()
+        pending = self._queued_riv("2026-06-17", based_on="Transaction", voucher_type="Delivery Note",
+                                   voucher_no=two_pairs.name)
+        self._draft("2026-08-26")
+
+        result = self._drain("2026-08-26", "2026-08-26")
+
+        self.assertEqual(result["stage"], "complete", result.get("error"))
+        self.assertNotIn(pending.name, result["riv_parked_pre"])
+        self.assertIn(pending.name, result["riv_left_queued_multi_pair"])
+        self.assertEqual(self._status(pending), "Queued", "the other warehouse still needs its repost")
+        self.assertEqual(result["repost_anchor"], "2026-06-17")
+
     def test_drain_async_passes_anchor_floor_to_the_job(self):
         with patch.object(frappe, "enqueue") as enqueue:
             dn_drain.drain_async(from_date="2026-08-01", to_date="2026-08-31", min_age_minutes=15,
