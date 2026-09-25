@@ -188,6 +188,9 @@ def drain(
     """
     started = time.time()
     timings: dict[str, float] = {}
+    # Set before anything can fail, so the exception path knows whether this
+    # call ever held the run key (cleanup is compare-and-delete on it).
+    run_id: Optional[str] = None
     result: dict = {
         "stage": "in_progress",
         "params": {
@@ -315,13 +318,13 @@ def drain(
         )
 
         if dry_run:
-            shadow_bin.cleanup()
+            shadow_bin.cleanup(run_id)
             result["stage"] = "dry_run_complete"
             result["timings"] = timings
             return result
 
         if not submitted:
-            shadow_bin.cleanup()
+            shadow_bin.cleanup(run_id)
             result["stage"] = "no_submits"
             result["timings"] = timings
             return result
@@ -373,7 +376,7 @@ def drain(
             }).insert(ignore_permissions=True)
             riv.submit()
             frappe.db.commit()
-            shadow_bin.cleanup()
+            shadow_bin.cleanup(run_id)
             result["stage"] = "repost_deferred_anchor_too_early"
             result["repost_anchor"] = str(exc.anchor)
             result["anchor_floor"] = str(exc.floor)
@@ -516,7 +519,7 @@ def drain(
         # ------------------------------------------------------------------
         # 8. Cleanup
         # ------------------------------------------------------------------
-        shadow_bin.cleanup()
+        shadow_bin.cleanup(run_id)
 
         timings["total_s"] = round(time.time() - started, 3)
         result["stage"] = "complete"
@@ -526,7 +529,7 @@ def drain(
     except Exception as exc:
         # Best-effort cleanup
         try:
-            shadow_bin.cleanup()
+            shadow_bin.cleanup(run_id)
         except Exception:
             pass
         import traceback
