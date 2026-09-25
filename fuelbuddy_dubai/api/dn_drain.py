@@ -14,10 +14,11 @@ Workflow per batch:
      all four deferred operations no-op while flags are set. Apply atomic
      decrement to the Redis shadow per item.
   5. After the batch:
-       a. Cancel any RIVs that got auto-queued despite the patch (defence in
-          depth; should be 0).
+       a. Park any RIVs that got auto-queued despite the patch (defence in
+          depth; should be 0) — INHERITING their anchors, see below.
        b. Run ONE consolidated Repost Item Valuation for the hot key from the
-          earliest posting_date in the batch. This recomputes:
+          earliest of (this batch's earliest posting_date, every anchor we
+          parked). This recomputes:
             - tabStock Ledger Entry: valuation_rate, stock_value,
               stock_value_difference, qty_after_transaction
             - tabGL Entry: deletes stale per-submit GLs, reinserts with
@@ -28,6 +29,25 @@ Workflow per batch:
        d. Reconcile shadow vs tabBin. Drift on actual_qty/reserved_qty must
           be float-precision noise (~1e-9). Any larger drift is a bug.
        e. Cleanup shadow keys.
+
+Anchor inheritance (IDEV-3156):
+  Parking a pending RIV without adopting its anchor silently destroys a
+  valuation repair that ERPNext had already queued. Production had 1,534
+  Skipped RIVs with anchors from 2026-06-01 to 2026-09-01 against only 3
+  Completed, and 22 unhealed valuation-chain breaks as the result.
+
+  The invariant this module now holds:
+
+      the consolidated repost is NEVER anchored later than any repost it
+      supersedes
+
+  `resolve_repost_anchor` is the pure statement of that rule and is unit
+  tested without a site; `_quiesce_pending_rivs` is its DB shell.
+
+  'In Progress' rows are a special case: we cannot tell a genuinely-running
+  repost from a zombie (one that died mid-walk and was left In Progress) from
+  SQL alone, so we adopt their anchor but leave their status untouched and
+  surface them in the result for a human to clear.
 
 Identity guarantee:
   Field-by-field diff against native ERPNext submit + consolidated repost
@@ -50,12 +70,81 @@ import time
 from typing import Optional
 
 import frappe
+from frappe.utils import getdate
 
 from fuelbuddy_dubai.api import shadow_bin
+from fuelbuddy_dubai.api.repost_anchor import AnchorTooEarly, resolve_repost_anchor
 
 
 HOT_ITEM = "FB/FL/00001"
 HOT_WAREHOUSE = "Default Warehouse - FFSL"
+
+# Statuses that represent a repost ERPNext still owes us.
+PENDING_RIV_STATUSES = ("Queued", "In Progress")
+
+
+def _quiesce_pending_rivs(item_code: str, warehouse: str) -> dict:
+    """Park Queued RIVs for the hot key and report every pending anchor.
+
+    Parking matters because an independent repost walking the same
+    item+warehouse while the drain submits will contend for the same rows —
+    that contention is what surfaces as
+    `QueryTimeoutError (1205, 'Lock wait timeout exceeded')`.
+
+    'In Progress' rows are reported but NOT touched: from SQL we cannot
+    distinguish a live worker from a repost that died mid-walk, and parking a
+    live one would abandon a partial walk. Their anchors are still adopted.
+    """
+    # based_on='Transaction' rows carry voucher_type/voucher_no and leave
+    # item_code/warehouse NULL, so filtering on item+warehouse alone is blind
+    # to them. In production that blind spot covered exactly the four reposts
+    # sitting on the three broken June DNs. Resolve those through the stock
+    # ledger instead (is_cancelled deliberately NOT filtered — a cancelled
+    # voucher still owes a repost).
+    rows = frappe.db.sql(
+        """
+        SELECT riv.name, riv.posting_date, riv.status, riv.based_on
+        FROM `tabRepost Item Valuation` riv
+        WHERE riv.status IN %(statuses)s
+          AND riv.docstatus = 1
+          AND (
+                (riv.item_code = %(item_code)s AND riv.warehouse = %(warehouse)s)
+             OR (
+                  riv.based_on = 'Transaction'
+                  AND EXISTS (
+                        SELECT 1 FROM `tabStock Ledger Entry` sle
+                        WHERE sle.voucher_type = riv.voucher_type
+                          AND sle.voucher_no   = riv.voucher_no
+                          AND sle.item_code    = %(item_code)s
+                          AND sle.warehouse    = %(warehouse)s
+                  )
+                )
+          )
+        """,
+        {
+            "statuses": PENDING_RIV_STATUSES,
+            "item_code": item_code,
+            "warehouse": warehouse,
+        },
+        as_dict=True,
+    )
+
+    queued = [r for r in rows if r.status == "Queued"]
+    in_progress = [r for r in rows if r.status == "In Progress"]
+
+    if queued:
+        frappe.db.sql(
+            "UPDATE `tabRepost Item Valuation` SET status='Skipped' WHERE name IN %s",
+            (tuple(r.name for r in queued),),
+        )
+        frappe.db.commit()
+
+    return {
+        # every pending anchor, parked or not — the caller MUST fold these in
+        "anchors": [r.posting_date for r in rows if r.posting_date],
+        "parked": [r.name for r in queued],
+        "in_progress_untouched": [r.name for r in in_progress],
+    }
 
 
 @frappe.whitelist()
@@ -68,6 +157,7 @@ def drain(
     item_code: str = HOT_ITEM,
     warehouse: str = HOT_WAREHOUSE,
     min_age_minutes: int = 0,
+    anchor_floor: Optional[str] = None,
 ) -> dict:
     """
     Drain back-dated draft Delivery Notes through the v3.6 fast path.
@@ -84,6 +174,13 @@ def drain(
                     ago (0 = no age filter); lets the scheduled drain leave
                     freshly punched DNs alone. Waived when a full batch_size
                     of backlog exists — throughput wins over the age guard.
+        anchor_floor: earliest posting_date the consolidated repost may be
+                    anchored at. Inheritance is unbounded by nature and
+                    pending anchors reach back to 2026-01-27 (~513k rows,
+                    days of walking), so pass this to cap it. When the
+                    resolved anchor is earlier, the drain leaves a Queued
+                    repost at that anchor and returns rather than starting
+                    a walk nobody sized.
 
     Returns:
         dict with stage breakdowns, per-phase timings, shadow reconciliation,
@@ -98,6 +195,7 @@ def drain(
             "batch_size": batch_size, "dry_run": int(dry_run),
             "item_code": item_code, "warehouse": warehouse,
             "min_age_minutes": int(min_age_minutes),
+            "anchor_floor": anchor_floor,
         },
     }
 
@@ -131,15 +229,13 @@ def drain(
         timings["shadow_init_s"] = round(time.time() - t, 3)
 
         # ------------------------------------------------------------------
-        # 3. Clean pre-existing RIVs in the path (defence in depth)
+        # 3. Quiesce pre-existing RIVs in the path, ADOPTING their anchors
         # ------------------------------------------------------------------
-        frappe.db.sql(
-            "UPDATE `tabRepost Item Valuation` SET status='Skipped' "
-            "WHERE status IN ('Queued','In Progress') "
-            "  AND item_code=%s AND warehouse=%s",
-            (item_code, warehouse),
-        )
-        frappe.db.commit()
+        inherited_anchors: list = []
+        quiesced_pre = _quiesce_pending_rivs(item_code, warehouse)
+        inherited_anchors += quiesced_pre["anchors"]
+        result["riv_parked_pre"] = quiesced_pre["parked"]
+        result["riv_in_progress_untouched"] = quiesced_pre["in_progress_untouched"]
 
         # ------------------------------------------------------------------
         # 4. Submit loop with all 4 patches engaged
@@ -157,13 +253,20 @@ def drain(
         try:
             for name in drafts:
                 # Pre-flight: shadow-based negative-stock check
+                # stock_qty, never qty: `qty` is in the LINE's UOM, so an
+                # imperial-gallon line understates stock movement 4.546x and
+                # both the negative-stock check and the shadow drift silently
+                # (IDEV-3156). tabBin is in stock UOM, so stock_qty is what
+                # reconciles.
                 items = frappe.get_all(
                     "Delivery Note Item",
                     filters={"parent": name},
-                    fields=["item_code", "warehouse", "qty"],
+                    fields=["item_code", "warehouse", "stock_qty"],
                 )
                 if any(
-                    shadow_bin.will_cause_negative(it.item_code, it.warehouse, it.qty)
+                    shadow_bin.will_cause_negative(
+                        it.item_code, it.warehouse, it.stock_qty
+                    )
                     for it in items
                 ):
                     skipped_negative.append(name)
@@ -174,7 +277,9 @@ def drain(
                     for it in items:
                         # Update shadow as if we submitted, so subsequent
                         # pre-flight checks are accurate
-                        shadow_bin.apply(it.item_code, it.warehouse, it.qty, name)
+                        shadow_bin.apply(
+                            it.item_code, it.warehouse, it.stock_qty, name
+                        )
                     continue
 
                 try:
@@ -182,7 +287,9 @@ def drain(
                     doc.submit()
                     frappe.db.commit()
                     for it in doc.items:
-                        shadow_bin.apply(it.item_code, it.warehouse, it.qty, name)
+                        shadow_bin.apply(
+                            it.item_code, it.warehouse, it.stock_qty, name
+                        )
                     submitted.append(name)
                 except Exception as exc:
                     frappe.db.rollback()
@@ -222,28 +329,71 @@ def drain(
         # ------------------------------------------------------------------
         # 5. Consolidated Repost Item Valuation
         # ------------------------------------------------------------------
-        # Clean any RIVs that may have been auto-queued during patches
-        # (defence in depth — should be 0 with patches working).
-        frappe.db.sql(
-            "UPDATE `tabRepost Item Valuation` SET status='Skipped' "
-            "WHERE status IN ('Queued','In Progress') "
-            "  AND item_code=%s AND warehouse=%s",
-            (item_code, warehouse),
+        # Park anything auto-queued during the patches (should be 0), again
+        # adopting anchors so nothing is lost.
+        quiesced_post = _quiesce_pending_rivs(item_code, warehouse)
+        inherited_anchors += quiesced_post["anchors"]
+        result["riv_parked_post"] = quiesced_post["parked"]
+        result["riv_in_progress_untouched"] = sorted(
+            set(result["riv_in_progress_untouched"])
+            | set(quiesced_post["in_progress_untouched"])
         )
-        frappe.db.commit()
 
         t = time.time()
-        earliest = frappe.db.sql(
+        batch_earliest = frappe.db.sql(
             "SELECT MIN(posting_date) FROM `tabDelivery Note` WHERE name IN %s",
             (tuple(submitted),),
         )[0][0]
+
+        # THE fix (IDEV-3156): never anchor later than anything superseded.
+        # anchor_floor caps how far inheritance may reach back — without it a
+        # single restarted Failed repost (anchors go back to 2026-01-27) would
+        # commit this call to a ~513k-row, multi-day inline walk.
+        try:
+            anchor = resolve_repost_anchor(
+                batch_earliest,
+                inherited_anchors,
+                anchor_floor=getdate(anchor_floor) if anchor_floor else None,
+            )
+        except AnchorTooEarly as exc:
+            # The DNs are submitted and their own values are correct; only the
+            # consolidated walk is outstanding. Leave a Queued RIV at the
+            # inherited anchor so nothing is lost, and hand the decision back.
+            riv = frappe.get_doc({
+                "doctype": "Repost Item Valuation",
+                "based_on": "Item and Warehouse",
+                "item_code": item_code,
+                "warehouse": warehouse,
+                "posting_date": exc.anchor,
+                "posting_time": "00:00:00",
+                "allow_negative_stock": 1,
+                "company": frappe.db.get_single_value(
+                    "Global Defaults", "default_company"
+                ),
+            }).insert(ignore_permissions=True)
+            riv.submit()
+            frappe.db.commit()
+            shadow_bin.cleanup()
+            result["stage"] = "repost_deferred_anchor_too_early"
+            result["repost_anchor"] = str(exc.anchor)
+            result["anchor_floor"] = str(exc.floor)
+            result["consolidated_repost"] = riv.name
+            result["error"] = str(exc)
+            result["timings"] = timings
+            return result
+        result["repost_anchor"] = str(anchor)
+        result["repost_anchor_batch_earliest"] = str(batch_earliest)
+        result["repost_anchor_inherited"] = anchor != batch_earliest
+
         company = frappe.db.get_single_value("Global Defaults", "default_company")
         riv = frappe.get_doc({
             "doctype": "Repost Item Valuation",
             "based_on": "Item and Warehouse",
             "item_code": item_code,
             "warehouse": warehouse,
-            "posting_date": earliest,
+            "posting_date": anchor,
+            # midnight: earlier than any real entry on the anchor date, so the
+            # walk cannot skip same-day rows
             "posting_time": "00:00:00",
             "allow_negative_stock": 1,
             "company": company,
@@ -254,8 +404,25 @@ def drain(
         from erpnext.stock.doctype.repost_item_valuation.repost_item_valuation import (
             repost as run_repost,
         )
-        run_repost(riv)
-        frappe.db.commit()
+
+        # RepostItemValuation.on_submit is a no-op outside tests
+        # (repost_item_valuation.py:218-232), so submitting does NOT enqueue —
+        # the hourly repost_entries() scheduler is the only thing that runs
+        # reposts. It selects status IN ('Queued','In Progress') with no lock
+        # (:497-505, :476-494), so it can pick this row up between our submit
+        # and this call and then run a second walk over the same
+        # item+warehouse. Two concurrent walks are what produce
+        # QueryTimeoutError (1205, 'Lock wait timeout exceeded'), so only run
+        # inline if the row is still ours.
+        riv.reload()
+        if riv.status == "Queued":
+            run_repost(riv)
+            frappe.db.commit()
+            riv.reload()
+            result["repost_ran_inline"] = True
+        else:
+            result["repost_ran_inline"] = False
+        result["repost_status"] = riv.status
         timings["repost_s"] = round(time.time() - t, 3)
         result["consolidated_repost"] = riv.name
 
@@ -263,33 +430,78 @@ def drain(
         # 6. SQL recompute of SO Item.delivered_qty and SO.per_delivered
         # ------------------------------------------------------------------
         t = time.time()
-        frappe.db.sql(
+        # Scoped to the Sales Orders this batch actually touched. The previous
+        # unscoped version rewrote every SO Item and every SO in the database
+        # on each batch, and its INNER JOIN meant an SO Item whose only DN had
+        # been cancelled was never reset — it kept a stale delivered_qty.
+        # LEFT JOIN + COALESCE resets those to 0 (IDEV-3156).
+        affected_sos = frappe.db.sql_list(
             """
-            UPDATE `tabSales Order Item` soi
-            JOIN (
-                SELECT so_detail, SUM(qty) AS d
-                FROM `tabDelivery Note Item` dni
-                JOIN `tabDelivery Note` dn ON dn.name = dni.parent
-                WHERE dn.docstatus = 1 AND dni.so_detail IS NOT NULL
-                GROUP BY so_detail
-            ) x ON x.so_detail = soi.name
-            SET soi.delivered_qty = x.d
-            """
+            SELECT DISTINCT soi.parent
+            FROM `tabDelivery Note Item` dni
+            JOIN `tabSales Order Item` soi ON soi.name = dni.so_detail
+            WHERE dni.parent IN %s AND dni.so_detail IS NOT NULL
+            """,
+            (tuple(submitted),),
         )
-        frappe.db.sql(
-            """
-            UPDATE `tabSales Order` so
-            JOIN (
-                SELECT parent,
-                       100 * SUM(delivered_qty) / NULLIF(SUM(qty), 0) AS pct
-                FROM `tabSales Order Item`
-                GROUP BY parent
-            ) x ON x.parent = so.name
-            SET so.per_delivered = COALESCE(x.pct, 0)
-            """
-        )
-        frappe.db.commit()
+        result["affected_sales_orders"] = len(affected_sos)
+
+        if affected_sos:
+            frappe.db.sql(
+                """
+                UPDATE `tabSales Order Item` soi
+                LEFT JOIN (
+                    SELECT dni.so_detail, SUM(dni.qty) AS d
+                    FROM `tabDelivery Note Item` dni
+                    JOIN `tabDelivery Note` dn ON dn.name = dni.parent
+                    WHERE dn.docstatus = 1 AND dni.so_detail IS NOT NULL
+                    GROUP BY dni.so_detail
+                ) x ON x.so_detail = soi.name
+                SET soi.delivered_qty = COALESCE(x.d, 0)
+                WHERE soi.parent IN %s
+                """,
+                (tuple(affected_sos),),
+            )
+            frappe.db.sql(
+                """
+                UPDATE `tabSales Order` so
+                LEFT JOIN (
+                    SELECT parent,
+                           100 * SUM(delivered_qty) / NULLIF(SUM(qty), 0) AS pct
+                    FROM `tabSales Order Item`
+                    GROUP BY parent
+                ) x ON x.parent = so.name
+                SET so.per_delivered = COALESCE(x.pct, 0)
+                WHERE so.name IN %s
+                """,
+                (tuple(affected_sos),),
+            )
+            frappe.db.commit()
         timings["billing_recompute_s"] = round(time.time() - t, 3)
+
+        # ------------------------------------------------------------------
+        # 6b. Restore Delivery Note billing status
+        # ------------------------------------------------------------------
+        # fb_skip_billing_status suppressed DeliveryNote.update_billing_status
+        # per submit, and step 6 only restores the SALES ORDER side. Without
+        # this, per_billed and status stay stale — production has 79,169 DNs
+        # reading "To Bill" whose litres are in fact invoiced (IDEV-3156).
+        # Runs with flags cleared so the real method executes. Per-document
+        # and therefore the slowest step here; it is timed separately so the
+        # cost is visible.
+        t = time.time()
+        billing_failed: list[dict] = []
+        for name in submitted:
+            try:
+                frappe.get_doc("Delivery Note", name).update_billing_status()
+                frappe.db.commit()
+            except Exception as exc:
+                frappe.db.rollback()
+                billing_failed.append({"name": name, "error": str(exc)[:300]})
+        frappe.db.commit()
+        timings["dn_billing_status_s"] = round(time.time() - t, 3)
+        result["dn_billing_status_failed_count"] = len(billing_failed)
+        result["dn_billing_status_failed"] = billing_failed[:20]
 
         # ------------------------------------------------------------------
         # 7. Reconcile shadow vs tabBin (must be zero drift on qty)
@@ -339,6 +551,7 @@ def drain_async(
     item_code: str = HOT_ITEM,
     warehouse: str = HOT_WAREHOUSE,
     min_age_minutes: int = 0,
+    anchor_floor: Optional[str] = None,
 ) -> dict:
     """
     Enqueue drain() on the long worker and return a job_id to poll via
@@ -347,6 +560,7 @@ def drain_async(
     with the skip-flags engaged but no consolidated repost, and a stale
     shadow RUN_KEY that blocks the next drain. RQ jobs have no such timeout.
     Explicit params (no **kwargs) so Frappe's `cmd` form param never leaks in.
+    anchor_floor is passed through untouched; see drain() (IDEV-3156).
     """
     job_id = "fb-dn-drain-" + frappe.generate_hash(length=8)
     frappe.enqueue(
@@ -360,6 +574,7 @@ def drain_async(
             "batch_size": batch_size, "dry_run": dry_run,
             "item_code": item_code, "warehouse": warehouse,
             "min_age_minutes": min_age_minutes,
+            "anchor_floor": anchor_floor,
         },
     )
     return {"job_id": job_id}
@@ -417,9 +632,11 @@ def _pick_drafts(
 
     limit = f"LIMIT {int(batch_size)}" if batch_size and batch_size > 0 else ""
 
+    # DISTINCT: a multi-line DN would otherwise appear once per matching line
+    # and be submitted twice, the second attempt landing in `failed`.
     return frappe.db.sql_list(
         f"""
-        SELECT dn.name
+        SELECT DISTINCT dn.name, dn.posting_date, dn.posting_time, dn.creation
         FROM `tabDelivery Note` dn
         JOIN `tabDelivery Note Item` dni ON dni.parent = dn.name
         WHERE {" AND ".join(where_parts)}
